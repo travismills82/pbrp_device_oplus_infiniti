@@ -9,11 +9,11 @@
 #define _REALLY_INCLUDE_SYS__SYSTEM_PROPERTIES_H_
 #include <sys/_system_properties.h>
 
-#include <fs_mgr.h>
+#include <cstring>
+#include <string>
 #include <unordered_map>
 
 using android::base::GetProperty;
-using android::fs_mgr::GetKernelCmdline;
 
 const std::unordered_map<int, std::string> kRegionSuffixMap = {
     {27,    "IN"},
@@ -75,14 +75,19 @@ void SetupModelProperties(const ModelInfo& info, const std::string& region) {
 }
 
 void vendor_load_properties() {
-    std::string buf = "0";
-    GetKernelCmdline("oplus_region", &buf);
+    int region = 0;
+    android::base::ParseInt(GetProperty("ro.boot.oplus_region", "0"), &region);
+    const auto region_iter = kRegionSuffixMap.find(region);
+    const std::string& region_suffix = region_iter != kRegionSuffixMap.end()
+            ? region_iter->second
+            : kRegionSuffixMap.find(0)->second;
 
-    auto region = std::stoi(buf);
-    auto region_suffix_iter = kRegionSuffixMap.find(region);
+    int prjname = 0;
+    android::base::ParseInt(GetProperty("ro.boot.prjname", "0"), &prjname);
+    const auto model_iter = kModelInfoMap.find(prjname);
+    const ModelInfo& model_info = model_iter != kModelInfoMap.end()
+            ? model_iter->second
+            : kModelInfoMap.find(0)->second;
 
-    auto prjname = std::stoi(GetProperty("ro.boot.prjname", "0"));
-    auto model_info = kModelInfoMap.find(prjname);
-
-    SetupModelProperties(model_info->second, region_suffix_iter->second);
+    SetupModelProperties(model_info, region_suffix);
 }

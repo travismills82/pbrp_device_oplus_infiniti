@@ -11,8 +11,10 @@ $(call inherit-product, $(DEVICE_PATH)/device.mk)
 
 ## Device identifier
 PRODUCT_DEVICE  := infiniti
-PRODUCT_NAME    := pbrp_infiniti
+PRODUCT_NAME    := pb_infiniti
 PRODUCT_BRAND   := oplus
+PRODUCT_MODEL   := OnePlus 15
+PRODUCT_MANUFACTURER := OnePlus
 TARGET_OTA_ASSERT_DEVICE := PLK110,OP611FL1,OP60FFL1,CPH2745,CPH2747,CPH2749
 
 # Theme

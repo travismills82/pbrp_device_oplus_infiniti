@@ -1,4 +1,4 @@
-# PBRP device tree for OPLUS infiniti
+# PBRP device tree for OnePlus 15 (infiniti)
 
 ## Supported devices
 
@@ -10,13 +10,13 @@
 mkdir pbrp && cd pbrp
 repo init -u https://github.com/PitchBlackRecoveryProject/manifest_pb -b android-12.1
 repo sync
-git clone --depth=1 https://github.com/travismills82/pbrp_device_oplus_infiniti
+git clone https://github.com/travismills82/pbrp_device_oplus_infiniti device/oplus/infiniti
 ```
 
 ```shell
-$ . build/envsetup.sh
-$ lunch pb_infiniti-eng
-$ mka pbrp
+. build/envsetup.sh
+lunch pb_infiniti-eng
+mka pbrp
 ```
 
 If there is no error, recovery.img will be found in `out/target/product/infiniti/recovery.img`
@@ -49,6 +49,3 @@ or
 fastboot flash recovery_a recovery.img
 fastboot flash recovery_b recovery.img
 ```
-# pbrp_device_oplus_infiniti
-
-# pbrp_device_oplus_infiniti
