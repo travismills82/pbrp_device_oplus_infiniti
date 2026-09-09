@@ -21,6 +21,7 @@ TARGET_CPU_VARIANT          := generic
 
 # A/B
 AB_OTA_UPDATER := true
+TW_USE_AIDL_BOOT_CONTROL := true
 
 AB_OTA_PARTITIONS := \
     boot \
@@ -63,6 +64,11 @@ ENABLE_SCHEDBOOST := true
 # Crypto
 BOARD_USES_METADATA_PARTITION   := true
 TW_INCLUDE_CRYPTO               := true
+TW_INCLUDE_CRYPTO_FBE           := true
+TW_USE_DMCTL                    := true
+RECOVERY_LIBRARY_SOURCE_FILES  += $(TARGET_OUT_SHARED_LIBRARIES)/android.hardware.gatekeeper.pbrp-ndk_platform.so
+RECOVERY_LIBRARY_SOURCE_FILES  += $(TARGET_OUT_SHARED_LIBRARIES)/android.hardware.weaver-V1-ndk_platform.so
+RECOVERY_LIBRARY_SOURCE_FILES  += $(TARGET_OUT_SHARED_LIBRARIES)/libpbrp_touch_compat.so
 
 # Debug
 TARGET_USES_LOGD                := true
@@ -74,10 +80,12 @@ RECOVERY_BINARY_SOURCE_FILES    += $(TARGET_OUT_EXECUTABLES)/strace
 
 # File systems
 TARGET_USERIMAGES_USE_F2FS := true
+TARGET_USERIMAGES_USE_EROFS := true
 
 # Init
 TARGET_INIT_VENDOR_LIB          := //$(DEVICE_PATH):libinit_oplus_infiniti
 TARGET_RECOVERY_DEVICE_MODULES  := libinit_oplus_infiniti
+TARGET_RECOVERY_DEVICE_MODULES  += android.hardware.boot@1.2-impl.recovery
 
 # Kernel
 BOARD_KERNEL_IMAGE_NAME     := Image
@@ -124,10 +132,10 @@ TW_USE_TOOLBOX                := true
 
 # TWRP display
 TW_BRIGHTNESS_PATH      := /sys/class/backlight/panel0-backlight/brightness
-TW_DEFAULT_BRIGHTNESS   := 1000
-TW_FRAMERATE            := 120
-TW_MAX_BRIGHTNESS       := 2047
-TW_SCREEN_BLANK_ON_BOOT := true
+TW_DEFAULT_BRIGHTNESS   := 2047
+TW_FRAMERATE            := 60
+TW_MAX_BRIGHTNESS       := 4094
+TW_SCREEN_TIMEOUT       := 120
 TW_THEME                := portrait_hdpi
 
 # TWRP file system
@@ -150,7 +158,14 @@ BOARD_AVB_ENABLE := true
 # Vibrator
 TW_SUPPORT_INPUT_AIDL_HAPTICS := true
 
+# Rear camera torch (warm and cool channels)
+PB_TORCH_PATH                         := "/sys/class/leds/yellow:flash-0"
+PB_TORCH_PATH_2                       := "/sys/class/leds/white:flash-1"
+PB_TORCH_MAX_BRIGHTNESS               := 64
+
 # Other TWRP Configurations
+TW_CUSTOM_BATTERY_PATH                 := "/sys/class/power_supply/battery"
+TW_BATTERY_SYSFS_WAIT_SECONDS          := 6
 TARGET_RECOVERY_QCOM_RTC_FIX            := true
 TW_CUSTOM_CPU_TEMP_PATH                 := "/sys/class/thermal/thermal_zone45/temp" # CPU-0-0-0
 TW_EXCLUDE_APEX                         := true

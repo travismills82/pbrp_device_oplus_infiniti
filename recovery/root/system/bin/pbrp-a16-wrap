@@ -1,0 +1,8 @@
+#!/system/bin/sh
+
+# Keep Android 16 vendor ABI shims private to the stock HALs that require them.
+# PBRP's Android 12.1 system libraries remain the global recovery runtime.
+export LD_PRELOAD=/system/lib64/libpbrp_touch_compat.so
+export LD_LIBRARY_PATH=/system/lib64/pbrp-a16-compat:/odm/lib64:/vendor/odm/lib64:/vendor/lib64/hw:/vendor/lib64:/system/lib64
+
+exec "$@"

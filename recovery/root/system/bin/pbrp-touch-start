@@ -1,0 +1,138 @@
+#!/system/bin/sh
+
+MODULE_DIRS="/system/lib/modules /vendor/lib/modules /vendor_dlkm/lib/modules /lib/modules"
+TOUCH_SERVICE="vendor.touch-aidl-2"
+
+log_msg() {
+    echo "[pbrp-touch] $1"
+    echo "[pbrp-touch] $1" > /dev/kmsg 2>/dev/null || true
+}
+
+module_name() {
+    echo "${1%.ko}" | tr '-' '_'
+}
+
+module_loaded() {
+    mod="$(module_name "$1")"
+    grep -q "^${mod} " /proc/modules 2>/dev/null
+}
+
+find_module() {
+    for dir in $MODULE_DIRS; do
+        if [ -f "$dir/$1" ]; then
+            echo "$dir/$1"
+            return 0
+        fi
+    done
+    return 1
+}
+
+load_module() {
+    mod="$1"
+
+    if module_loaded "$mod"; then
+        log_msg "$mod already loaded"
+        return 0
+    fi
+
+    path="$(find_module "$mod")" || {
+        log_msg "missing module: $mod"
+        return 1
+    }
+
+    log_msg "loading $path"
+    insmod "$path" 2>/tmp/pbrp-touch-insmod.err && return 0
+
+    if module_loaded "$mod"; then
+        log_msg "$mod loaded despite insmod warning"
+        return 0
+    fi
+
+    log_msg "failed loading $mod: $(cat /tmp/pbrp-touch-insmod.err 2>/dev/null)"
+    return 1
+}
+
+stop_touch_hal() {
+    setprop ctl.stop "$TOUCH_SERVICE" 2>/dev/null || true
+
+    count=0
+    while [ "$count" -lt 10 ]; do
+        state="$(getprop "init.svc.${TOUCH_SERVICE}" 2>/dev/null)"
+        case "$state" in
+            ""|stopped|disabled)
+                return 0
+                ;;
+        esac
+        sleep 1
+        count=$((count + 1))
+    done
+
+    log_msg "warning: $TOUCH_SERVICE did not stop cleanly"
+    return 1
+}
+
+start_touch_hal() {
+    setprop ctl.start "$TOUCH_SERVICE" 2>/dev/null || true
+
+    count=0
+    while [ "$count" -lt 15 ]; do
+        state="$(getprop "init.svc.${TOUCH_SERVICE}" 2>/dev/null)"
+        if [ "$state" = "running" ]; then
+            log_msg "$TOUCH_SERVICE is running"
+            return 0
+        fi
+        sleep 1
+        count=$((count + 1))
+    done
+
+    log_msg "failed to start $TOUCH_SERVICE; state=$(getprop "init.svc.${TOUCH_SERVICE}" 2>/dev/null)"
+    return 1
+}
+
+setprop twrp.touch.status starting
+setprop twrp.touch.modules.ready 0
+
+# Do not let the ODM property trigger race module insertion. Stop the HAL both
+# before and after insertion in case vendor init attempted a concurrent start.
+stop_touch_hal || true
+
+load_failed=0
+for mod in \
+    oplus_bsp_tp_common.ko \
+    oplus_bsp_tp_notify.ko \
+    oplus_bsp_tp_custom.ko \
+    oplus_bsp_tp_focal_common.ko \
+    oplus_bsp_tp_syna_common.ko \
+    oplus_bsp_synaptics_tcm2.ko \
+    oplus_bsp_tp_tcm_S3910.ko; do
+    load_module "$mod" || load_failed=1
+done
+
+stop_touch_hal || true
+
+for required in \
+    oplus_bsp_tp_common.ko \
+    oplus_bsp_tp_syna_common.ko \
+    oplus_bsp_synaptics_tcm2.ko \
+    oplus_bsp_tp_tcm_S3910.ko; do
+    if ! module_loaded "$required"; then
+        log_msg "required module is not loaded: $required"
+        load_failed=1
+    fi
+done
+
+if [ "$load_failed" -ne 0 ]; then
+    setprop twrp.touch.status module-error
+    log_msg "touch HAL left stopped because required modules are incomplete"
+    exit 1
+fi
+
+setprop twrp.touch.modules.ready 1
+
+if start_touch_hal; then
+    setprop twrp.touch.status ready
+    exit 0
+fi
+
+setprop twrp.touch.status hal-error
+exit 1

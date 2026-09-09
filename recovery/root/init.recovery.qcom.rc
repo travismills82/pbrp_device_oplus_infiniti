@@ -25,7 +25,20 @@
 # ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
+import /vendor/odm/etc/init/android.hardware.security.keymint3-service.strongbox.nxp.qcom.rc
+import /vendor/odm/etc/init/android.hardware.weaver-service.nxp.rc
+import /vendor/odm/etc/init/vendor-oplus-hardware-touch-V2-hbp5-service.rc
+import /vendor/odm/etc/init/vibrator-default.rc
+
 on early-init
+    # TARGET_RECOVERY_DEVICE_DIRS stages ODM payloads below /vendor/odm, while
+    # the proprietary services and VINTF fragments use their normal /odm paths.
+    symlink /vendor/odm/etc /odm/etc
+    # The stock touch HAL links the stable V1 NDK filename. Android 12.1 names
+    # the ABI-identical recovery build with an _platform suffix, so expose the
+    # filename expected by the device binary without importing newer Binder.
+    symlink /system/lib64/android.frameworks.stats-V1-ndk_platform.so /system/lib64/android.frameworks.stats-V1-ndk.so
+    stop vendor.touch-aidl-2
     start vendor.gatekeeper_default
 
 service post-boot-script /system/bin/sh -c /vendor/bin/init.kernel.post_boot-canoe_default_6_2.sh
@@ -34,15 +47,36 @@ service post-boot-script /system/bin/sh -c /vendor/bin/init.kernel.post_boot-can
     oneshot
     seclabel u:r:recovery:s0
 
+service pbrp-touch-start /system/bin/pbrp-touch-start
+    user root
+    group root
+    disabled
+    oneshot
+    seclabel u:r:recovery:s0
+
+service pbrp-charging /system/bin/pbrp-charging daemon
+    user root
+    group root
+    disabled
+    seclabel u:r:recovery:s0
+
+service pbrp-decrypt-prereqs /system/bin/pbrp-decrypt-prereqs
+    user root
+    group root system drmrpc
+    disabled
+    oneshot
+    seclabel u:r:recovery:s0
+
 on early-fs
     write /proc/sys/walt/sched_lib_name "recovery,Updater,updater,update_engine_sideload"
     write /proc/sys/walt/sched_lib_mask_force 255
 
 on init
-    write /sys/class/backlight/panel0-backlight/brightness 200
+    write /sys/class/backlight/panel0-backlight/brightness 2047
     setprop sys.usb.configfs 1
     start vendor.boot-qti
     setprop prepdecrypt.setpatch true
+    setprop twrp.decrypt.prereq preparing
 
 on property:ro.boot.usbcontroller=*
     setprop sys.usb.controller ${ro.boot.usbcontroller}
@@ -55,7 +89,10 @@ on fs
     symlink /dev/block/platform/soc/${ro.boot.bootdevice} /dev/block/bootdevice
     write /proc/sys/kernel/firmware_config/force_sysfs_fallback 1
 
-on property:twrp.modules.loaded=true
+on property:twrp.fstab.ready=1
+    start pbrp-touch-start
+    start pbrp-charging
+    start vendor.oplus.vibrator
     # Mount firmware
     mkdir /firmware
     mount vfat /dev/block/bootdevice/by-name/modem${ro.boot.slot_suffix} /firmware ro
@@ -63,10 +100,16 @@ on property:twrp.modules.loaded=true
     wait /sys/kernel/boot_adsp/ssr
     write /sys/kernel/boot_adsp/ssr 1
     wait /sys/class/power_supply/battery
-    start vendor.health-default
+    # The stock AIDL health binary requires Android 16 Binder APIs. Recovery's
+    # in-tree HIDL health service reports the same power-supply sysfs safely.
+    start health-hal-2-1
     umount /firmware
 
-on property:ro.crypto.state=encrypted && property:ro.boot.dynamic_partitions=true
+on property:twrp.fstab.ready=1 && property:ro.crypto.state=encrypted && property:ro.boot.dynamic_partitions=true
+    setprop twrp.decrypt.prereq preparing
+    start pbrp-decrypt-prereqs
+
+on property:twrp.decrypt.prereq=ready
     start prepdecrypt.vendor
 
 on property:hwservicemanager.ready=true
@@ -74,5 +117,4 @@ on property:hwservicemanager.ready=true
 
 on property:vendor.sys.listeners.registered=true
     start vendor.ssgtzd
-    start vendor.keymint-strongbox
     start vendor.oplus.vibrator

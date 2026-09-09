@@ -1,0 +1,363 @@
+#!/system/bin/sh
+
+PERSIST_BLOCKS="/dev/block/bootdevice/by-name/persist /dev/block/by-name/persist"
+PERSIST_VENDOR_MOUNT="/mnt/vendor/persist"
+PERSIST_TWRP_MOUNT="/persist"
+MODULE_DIRS="/system/lib/modules /vendor/lib/modules /vendor_dlkm/lib/modules /lib/modules"
+NFC_DEVICE="/dev/nq-nci"
+SECURE_ELEMENT_BINDER="android.hardware.secure_element.ISecureElement/eSE1"
+OMAPI_BINDER="android.se.omapi.ISecureElementService/default"
+CRYPTO_SERVICES="vendor.qseecomd vendor.gatekeeper_default vendor.keymint-qti vendor.weaver_nxp vendor.keymint-strongbox"
+REQUIRED_HAL_BINDERS="android.hardware.gatekeeper.IGatekeeper/default android.hardware.security.keymint.IKeyMintDevice/default android.hardware.weaver.IWeaver/default android.hardware.security.keymint.IKeyMintDevice/strongbox android.hardware.security.sharedsecret.ISharedSecret/strongbox android.hardware.security.keymint.IRemotelyProvisionedComponent/strongbox"
+KEYSTORE_BINDER="android.system.keystore2.IKeystoreService/default"
+
+log_msg() {
+    echo "[pbrp-decrypt] $1"
+    echo "[pbrp-decrypt] $1" > /dev/kmsg 2>/dev/null || true
+}
+
+set_status() {
+    setprop twrp.decrypt.status "$1" 2>/dev/null || true
+}
+
+fail_prereq() {
+    set_status "$1"
+    setprop twrp.decrypt.prereq failed 2>/dev/null || true
+    log_msg "$2"
+    exit 1
+}
+
+service_state() {
+    getprop "init.svc.$1" 2>/dev/null
+}
+
+start_service() {
+    svc="$1"
+    state="$(service_state "$svc")"
+    case "$state" in
+        running|restarting)
+            log_msg "$svc already $state"
+            return 0
+            ;;
+    esac
+
+    log_msg "starting $svc"
+    setprop ctl.start "$svc" 2>/dev/null || true
+}
+
+stop_service() {
+    svc="$1"
+    state="$(service_state "$svc")"
+    case "$state" in
+        running|restarting|starting)
+            log_msg "stopping $svc"
+            setprop ctl.stop "$svc" 2>/dev/null || true
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+
+    count=0
+    while [ "$count" -lt 10 ]; do
+        state="$(service_state "$svc")"
+        case "$state" in
+            stopped|"") return 0 ;;
+        esac
+        sleep 1
+        count=$((count + 1))
+    done
+
+    log_msg "$svc did not stop cleanly; continuing"
+    return 1
+}
+
+restart_service() {
+    svc="$1"
+    stop_service "$svc" || true
+    start_service "$svc"
+}
+
+wait_service_running() {
+    svc="$1"
+    timeout="$2"
+    count=0
+
+    while [ "$count" -lt "$timeout" ]; do
+        [ "$(service_state "$svc")" = "running" ] && return 0
+        sleep 1
+        count=$((count + 1))
+    done
+
+    log_msg "$svc not running after ${timeout}s"
+    return 1
+}
+
+wait_property() {
+    name="$1"
+    expected="$2"
+    timeout="$3"
+    count=0
+
+    while [ "$count" -lt "$timeout" ]; do
+        [ "$(getprop "$name" 2>/dev/null)" = "$expected" ] && return 0
+        sleep 1
+        count=$((count + 1))
+    done
+
+    return 1
+}
+
+wait_path() {
+    path="$1"
+    timeout="$2"
+    count=0
+
+    while [ "$count" -lt "$timeout" ]; do
+        [ -e "$path" ] && return 0
+        sleep 1
+        count=$((count + 1))
+    done
+
+    return 1
+}
+
+module_name() {
+    echo "${1%.ko}" | tr '-' '_'
+}
+
+# Android's recovery shell does not provide function-local variables by
+# default. Keep temporary names in subshells so checking a normalized module
+# name cannot overwrite the original filename used by the caller.
+module_loaded() (
+    mod="$(module_name "$1")"
+    grep -q "^${mod} " /proc/modules 2>/dev/null
+)
+
+find_module() (
+    mod="$1"
+    for dir in $MODULE_DIRS; do
+        if [ -f "$dir/$mod" ]; then
+            echo "$dir/$mod"
+            return 0
+        fi
+    done
+    return 1
+)
+
+load_module_if_available() {
+    mod="$1"
+
+    if module_loaded "$mod"; then
+        log_msg "$mod already loaded"
+        return 0
+    fi
+
+    path="$(find_module "$mod")" || {
+        log_msg "$mod not found in runtime module paths"
+        return 1
+    }
+
+    log_msg "loading $path"
+    if insmod "$path" 2>/tmp/pbrp-decrypt-insmod.err; then
+        log_msg "loaded $mod"
+        return 0
+    fi
+
+    if module_loaded "$mod"; then
+        log_msg "$mod loaded despite insmod warning"
+        return 0
+    fi
+
+    log_msg "failed loading $mod: $(cat /tmp/pbrp-decrypt-insmod.err 2>/dev/null)"
+    return 1
+}
+
+binder_service_available() {
+    # The recovery image intentionally omits Android's general service utility.
+    # Check Binder directly: process state alone does not prove registration.
+    [ -x /system/bin/pbrp-service-check ] || return 1
+    /system/bin/pbrp-service-check "$1" >/dev/null 2>&1
+}
+
+wait_binder_service() {
+    name="$1"
+    timeout="$2"
+    count=0
+
+    while [ "$count" -lt "$timeout" ]; do
+        binder_service_available "$name" && {
+            log_msg "binder ready: $name"
+            return 0
+        }
+        sleep 1
+        count=$((count + 1))
+    done
+
+    log_msg "binder service not ready after ${timeout}s: $name"
+    return 1
+}
+
+is_mounted() {
+    target="$1"
+    grep -q " $target " /proc/mounts 2>/dev/null
+}
+
+find_persist_block() {
+    for block in $PERSIST_BLOCKS; do
+        [ -e "$block" ] && echo "$block" && return 0
+    done
+    return 1
+}
+
+bind_persist_mount() {
+    src="$1"
+    dst="$2"
+
+    is_mounted "$dst" && return 0
+    mkdir -p "$dst" 2>/dev/null || true
+
+    log_msg "binding $src to $dst"
+    mount -o bind "$src" "$dst" 2>/tmp/twrp-persist-bind.err && return 0
+
+    log_msg "failed binding $src to $dst: $(cat /tmp/twrp-persist-bind.err 2>/dev/null)"
+    return 1
+}
+
+mount_persist() {
+    mkdir -p "$PERSIST_VENDOR_MOUNT" "$PERSIST_TWRP_MOUNT" 2>/dev/null || true
+
+    if is_mounted "$PERSIST_VENDOR_MOUNT"; then
+        log_msg "$PERSIST_VENDOR_MOUNT already mounted"
+        bind_persist_mount "$PERSIST_VENDOR_MOUNT" "$PERSIST_TWRP_MOUNT" || true
+    elif is_mounted "$PERSIST_TWRP_MOUNT"; then
+        log_msg "$PERSIST_TWRP_MOUNT already mounted"
+        bind_persist_mount "$PERSIST_TWRP_MOUNT" "$PERSIST_VENDOR_MOUNT" || true
+    else
+        count=0
+        block=""
+        while [ "$count" -lt 10 ]; do
+            block="$(find_persist_block)" && break
+            sleep 1
+            count=$((count + 1))
+        done
+
+        if [ -z "$block" ]; then
+            log_msg "persist block device not found"
+            return 1
+        fi
+
+        log_msg "mounting $PERSIST_VENDOR_MOUNT from $block"
+        if ! mount -t ext4 -o noatime,nosuid,nodev,barrier=1 "$block" "$PERSIST_VENDOR_MOUNT" 2>/tmp/twrp-persist-mount.err; then
+            mount -t ext4 "$block" "$PERSIST_VENDOR_MOUNT" 2>/tmp/twrp-persist-mount.err || {
+                log_msg "failed to mount $PERSIST_VENDOR_MOUNT: $(cat /tmp/twrp-persist-mount.err 2>/dev/null)"
+                return 1
+            }
+        fi
+
+        bind_persist_mount "$PERSIST_VENDOR_MOUNT" "$PERSIST_TWRP_MOUNT" || {
+            log_msg "bind mount failed; mounting persist directly at $PERSIST_TWRP_MOUNT"
+            mount -t ext4 "$block" "$PERSIST_TWRP_MOUNT" 2>/tmp/twrp-persist-mount.err || true
+        }
+    fi
+
+    if ! is_mounted "$PERSIST_VENDOR_MOUNT"; then
+        log_msg "$PERSIST_VENDOR_MOUNT is not mounted after setup"
+        return 1
+    fi
+
+    if ! is_mounted "$PERSIST_TWRP_MOUNT"; then
+        log_msg "$PERSIST_TWRP_MOUNT is not mounted after setup"
+        return 1
+    fi
+
+    log_msg "persist ready at $PERSIST_VENDOR_MOUNT and $PERSIST_TWRP_MOUNT"
+    return 0
+}
+
+setprop twrp.decrypt.prereq preparing 2>/dev/null || true
+set_status preparing
+[ "$(getprop twrp.fstab.ready)" = "1" ] || fail_prereq vendor-not-ready "temporary vendor mounts are not released"
+[ -x /system/bin/pbrp-service-check ] || fail_prereq binder-check-missing "Binder readiness checker is missing"
+mount_persist || fail_prereq persist-mount-failed "persist mount setup failed; not starting decrypt services"
+
+# The NXP services reject requests while Android reports boot incomplete.
+setprop sys.boot_completed 1 2>/dev/null || true
+wait_property sys.boot_completed 1 5 || log_msg "sys.boot_completed did not settle"
+
+# The secure-element HAL requires the Qualcomm secure channel and the NXP NFC
+# device. Older successful boots loaded nxp-nci before the HAL initialized;
+# current vendor init can start the HAL before that device is ready.
+set_status preparing-nfc
+start_service vendor.qseecomd
+wait_service_running vendor.qseecomd 20 || fail_prereq qseecomd-failed "vendor.qseecomd did not become ready"
+start_service vendor.ssgtzd
+wait_service_running vendor.ssgtzd 20 || true
+
+if [ ! -e "$NFC_DEVICE" ]; then
+    load_module_if_available smcinvoke_dlkm.ko || true
+    load_module_if_available nxp-nci.ko || true
+fi
+
+wait_path "$NFC_DEVICE" 20 || fail_prereq nfc-device-missing "$NFC_DEVICE did not appear; cannot initialize the embedded secure element"
+log_msg "NFC secure-element device ready: $NFC_DEVICE"
+
+# Both daemons may already be running with a cached failed eSE probe. Stop the
+# OMAPI client first, then reinitialize the HAL after persist/QSEE/NFC readiness.
+set_status restarting-secure-element
+stop_service se_omapi || true
+stop_service vendor.secure_element || true
+sleep 1
+start_service vendor.secure_element
+wait_service_running vendor.secure_element 20 || fail_prereq secure-element-failed "vendor.secure_element did not become ready"
+wait_binder_service "$SECURE_ELEMENT_BINDER" 30 || fail_prereq secure-element-binder-failed "secure-element binder did not become ready"
+
+# Allow the HAL's chip/vendor detection and trusted-app initialization to finish
+# before OMAPI opens a reader.
+sleep 6
+
+set_status restarting-omapi
+start_service se_omapi
+wait_service_running se_omapi 20 || fail_prereq omapi-failed "se_omapi did not become ready"
+wait_binder_service "$OMAPI_BINDER" 30 || fail_prereq omapi-binder-failed "OMAPI binder did not become ready"
+sleep 2
+
+set_status starting-crypto-services
+for svc in vendor.gatekeeper_default vendor.keymint-qti; do
+    start_service "$svc"
+done
+
+# Restart Weaver only after the refreshed eSE and OMAPI services are available.
+restart_service vendor.weaver_nxp
+start_service vendor.keymint-strongbox
+
+set_status waiting-init-services
+for svc in $CRYPTO_SERVICES; do
+    wait_service_running "$svc" 30 || true
+done
+
+set_status waiting-binder-services
+missing_required=0
+for svc in $REQUIRED_HAL_BINDERS; do
+    wait_binder_service "$svc" 45 || missing_required=1
+done
+
+if [ "$missing_required" -ne 0 ]; then
+    fail_prereq failed "required decrypt binder services are not ready; not starting prepdecrypt"
+fi
+
+# Keystore2 negotiates its shared secret when it starts. Restart it only after
+# both the default and StrongBox KeyMint stacks have registered.
+set_status restarting-keystore
+restart_service keystore2
+wait_service_running keystore2 30 || fail_prereq keystore-failed "keystore2 did not become ready"
+wait_binder_service "$KEYSTORE_BINDER" 45 || fail_prereq keystore-binder-failed "keystore2 binder did not become ready"
+
+# Let the HALs settle after registration before prepdecrypt and PIN entry.
+sleep 2
+
+set_status ready
+setprop twrp.decrypt.prereq ready 2>/dev/null || true
+log_msg "decrypt prerequisites are ready"
+
+exit 0

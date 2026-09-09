@@ -29,6 +29,12 @@ PRODUCT_USE_DYNAMIC_PARTITIONS := true
 # Recovery compatibility
 PRODUCT_OTA_ENFORCE_VINTF_KERNEL_REQUIREMENTS   := false
 
+# Android 16 vendor HAL compatibility kept local to the recovery ramdisk.
+PRODUCT_PACKAGES += \
+	android.hardware.weaver-V1-ndk_platform \
+	libpbrp_touch_compat \
+	pbrp_bundled_magisk_zip
+
 # OTA certs
 PRODUCT_EXTRA_RECOVERY_KEYS += \
 	$(DEVICE_PATH)/security/local_OTA \

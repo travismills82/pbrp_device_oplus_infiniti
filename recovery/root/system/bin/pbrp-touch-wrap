@@ -1,0 +1,4 @@
+#!/system/bin/sh
+
+export LD_PRELOAD=/system/lib64/libpbrp_touch_compat.so
+exec "$@"

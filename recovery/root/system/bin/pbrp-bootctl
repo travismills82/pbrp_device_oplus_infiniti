@@ -1,0 +1,5 @@
+#!/system/bin/sh
+
+# The stock boot HAL is AIDL. Run the Android 16 bootctl client with the same
+# private ABI compatibility environment used by the stock vendor HALs.
+exec /system/bin/pbrp-a16-wrap /system/bin/pbrp-bootctl-a16 "$@"

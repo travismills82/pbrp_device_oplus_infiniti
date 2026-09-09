@@ -4,8 +4,9 @@ on early-init
 on init
     write /proc/sys/kernel/firmware_config/force_sysfs_fallback 1
 
-service vendor.touch-aidl-2  /odm/bin/hw/vendor-oplus-hardware-touch-V2-hbp5-service
+service vendor.touch-aidl-2 /system/bin/pbrp-touch-wrap /odm/bin/hw/vendor-oplus-hardware-touch-V2-hbp5-service
     class hal
+    disabled
     capabilities SYS_NICE
     user root
     group system everybody
@@ -74,6 +75,3 @@ on post-fs-data
     mkdir /data/vendor/touch/upload 0771 system system
     write /proc/sys/kernel/firmware_config/force_sysfs_fallback 1
     
-on late-init
-    start vendor.touch-aidl-2
-

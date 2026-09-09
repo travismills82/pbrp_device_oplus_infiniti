@@ -1,8 +1,23 @@
-//
-// Copyright (C) 2025 The Android Open Source Project
-//
-// SPDX-License-Identifier: Apache-2.0
-//
+cc_library_shared {
+    name: "libpbrp_touch_compat",
+    srcs: ["touch_compat.cpp"],
+    shared_libs: [
+        "libbase",
+        "libutils",
+    ],
+    compile_multilib: "64",
+    recovery_available: true,
+    cflags: [
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+}
 
-soong_namespace {
+prebuilt_etc {
+    name: "pbrp_bundled_magisk_zip",
+    src: "prebuilts/magisk/Magisk.zip",
+    filename: "Magisk.zip",
+    sub_dir: "magisk",
+    recovery: true,
 }
