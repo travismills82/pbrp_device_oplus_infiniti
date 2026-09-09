@@ -1,0 +1,443 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Travis Mills <travismills82@gmail.com>
+Date: Tue, 8 Sep 2026 21:11:00 -0500
+Subject: [PATCH] vold: bridge Infiniti Android 16 FBE services
+
+Teach the Android 12.1 recovery vold path to use the OnePlus 15 AIDL
+Gatekeeper and Weaver services while retaining its legacy HIDL fallback.
+Bound Keystore startup waits, keep successful CE unlock state across a data
+refresh, tolerate an existing key-upgrade directory, and avoid rejecting a
+filesystem key solely because the optional recovery keyring cache is absent.
+
+These changes keep missing proprietary services fail-closed without freezing
+the recovery UI.
+---
+
+diff --git a/Android.bp b/Android.bp
+index 376157b4880cf35bb715433a1c88507a91d23f6a..6b1579fd0ef71d225fb60ad6f3e25d4fe89bb12d 100644
+--- a/Android.bp
++++ b/Android.bp
+@@ -173,11 +173,13 @@ cc_library_static {
+     },
+     shared_libs: [
+         "android.hardware.confirmationui@1.0",
++        "android.hardware.gatekeeper.pbrp-ndk_platform",
+         "android.hardware.gatekeeper@1.0",
+         "android.hardware.health.storage@1.0",
+         "android.hardware.health.storage-V1-ndk_platform",
+         "android.hardware.keymaster@4.1",
+         "android.hardware.security.keymint-V1-ndk_platform",
++        "android.hardware.weaver-V1-ndk_platform",
+         "android.hardware.weaver@1.0",
+         "android.security.apc-ndk_platform",
+         "android.system.keystore2-V1-ndk_platform",
+diff --git a/Checkpoint.cpp b/Checkpoint.cpp
+index 755f0e3b3401350a61a764364cf6af7b3126f701..71cb9cd9d6e5ba84d535efe628486fc6799c61e2 100644
+--- a/Checkpoint.cpp
++++ b/Checkpoint.cpp
+@@ -276,7 +276,11 @@ bool cp_needsCheckpoint() {
+ 
+     bool ret;
+     std::string content;
+-    sp<IBootControl> module = IBootControl::getService();
++    // Modern devices may expose only the AIDL BootControl HAL.  Recovery must
++    // not block forever waiting for the legacy HIDL service just to determine
++    // whether an fs checkpoint is active.  A missing HIDL service is handled
++    // below by checking vold's on-disk checkpoint marker.
++    sp<IBootControl> module = IBootControl::tryGetService();
+ 
+     if (isCheckpointing) return isCheckpointing;
+ 
+diff --git a/Decrypt.cpp b/Decrypt.cpp
+index d9f034b538454354a65682dd58ed02f4badd7d5b..75d9a19236c1b13d116d8f42843dd6ecb5f716bd 100755
+--- a/Decrypt.cpp
++++ b/Decrypt.cpp
+@@ -28,7 +28,6 @@
+ #include <sys/types.h>
+ 
+ #include <keyutils.h>
+-#include "Weaver1.h"
+ #include "cutils/properties.h"
+ 
+ #include <openssl/sha.h>
+@@ -50,6 +49,7 @@
+ #include <android-base/logging.h>
+ #include <base/threading/platform_thread.h>
+ #include <android/hardware/confirmationui/1.0/types.h>
++#include <aidl/android/hardware/gatekeeper/IGatekeeper.h>
+ #include <aidl/android/hardware/security/keymint/HardwareAuthToken.h>
+ #include <aidl/android/security/authorization/IKeystoreAuthorization.h>
+ #include <aidl/android/security/apc/BnConfirmationCallback.h>
+@@ -57,6 +57,8 @@
+ #include <aidl/android/system/keystore2/ResponseCode.h>
+ #include <android/hardware/gatekeeper/1.0/IGatekeeper.h>
+ 
++#include "Weaver1.h"
++
+ #include <binder/IServiceManager.h>
+ #include <binder/IPCThreadState.h>
+ #include <hardware/hw_auth_token.h>
+@@ -94,6 +96,8 @@ using ::aidl::android::hardware::security::keymint::HardwareAuthToken;
+ using aidl::android::system::keystore2::IKeystoreService;
+ using android::security::keymaster::OperationResult;
+ using android::hardware::keymaster::V4_1::support::blob2hidlVec;
++using AidlGatekeeperVerifyResponse = aidl::android::hardware::gatekeeper::GatekeeperVerifyResponse;
++using AidlIGatekeeper = aidl::android::hardware::gatekeeper::IGatekeeper;
+ using android::hardware::gatekeeper::V1_0::GatekeeperResponse;
+ using GKResponse = ::android::service::gatekeeper::GateKeeperResponse;
+ 
+@@ -749,11 +753,15 @@ bool Decrypt_User_Synth_Pass(const userid_t user_id, const std::string& Password
+ 		memcpy((void*)&application_id[0], (void*)&password_token[0], PASSWORD_TOKEN_SIZE);
+ 		memcpy((void*)&application_id[PASSWORD_TOKEN_SIZE], secdiscardable, SHA512_DIGEST_LENGTH);
+ 		if (Password != "!") {
+-			int ret = -1;
+-			bool request_reenroll = false;
++			constexpr const char gatekeeper_service_name[] =
++				"android.hardware.gatekeeper.IGatekeeper/default";
++			::ndk::SpAIBinder gk_binder(AServiceManager_checkService(gatekeeper_service_name));
++			auto aidl_gk_device = AidlIGatekeeper::fromBinder(gk_binder);
+ 			android::sp<android::hardware::gatekeeper::V1_0::IGatekeeper> gk_device;
+-			gk_device = ::android::hardware::gatekeeper::V1_0::IGatekeeper::getService();
+-			if (gk_device == nullptr) {
++			if (!aidl_gk_device) {
++				gk_device = ::android::hardware::gatekeeper::V1_0::IGatekeeper::getService();
++			}
++			if (!aidl_gk_device && gk_device == nullptr) {
+ 				printf("failed to get gatekeeper service\n");
+ 				return Free_Return(retval, weaver_key, &pwd);
+ 			}
+@@ -761,51 +769,74 @@ bool Decrypt_User_Synth_Pass(const userid_t user_id, const std::string& Password
+ 				printf("no password handle supplied\n");
+ 				return Free_Return(retval, weaver_key, &pwd);
+ 			}
+-			android::hardware::hidl_vec<uint8_t> pwd_handle_hidl;
+-			pwd_handle_hidl.setToExternal(const_cast<uint8_t *>((const uint8_t *)pwd.password_handle), pwd.handle_len);
+ 			void* gk_pwd_token = PersonalizedHashBinary(PERSONALIZATION_USER_GK_AUTH, (char*)&password_token[0], PASSWORD_TOKEN_SIZE);
+ 			if (!gk_pwd_token) {
+ 				printf("malloc error getting gatekeeper_key\n");
+ 				return Free_Return(retval, weaver_key, &pwd);
+ 			}
+-			android::hardware::hidl_vec<uint8_t> gk_pwd_token_hidl;
+-			GKResponse gkResponse;
+-			gk_pwd_token_hidl.setToExternal(const_cast<uint8_t *>((const uint8_t *)gk_pwd_token), SHA512_DIGEST_LENGTH);
+-			android::hardware::Return<void> hwRet =
+-				gk_device->verify(fakeUid(user_id), 0 /* challenge */,
+-								  pwd_handle_hidl,
+-								  gk_pwd_token_hidl,
+-								  [&gkResponse]
+-									// []
+-									(const android::hardware::gatekeeper::V1_0::GatekeeperResponse &rsp) {
+-										// ret = static_cast<int>(rsp.code); // propagate errors
+-										if (rsp.code >= android::hardware::gatekeeper::V1_0::GatekeeperStatusCode::STATUS_OK) {
+-											gkResponse = GKResponse::ok({rsp.data.begin(), rsp.data.end()});
+-											const hw_auth_token_t* hwAuthToken =
+-												reinterpret_cast<const hw_auth_token_t*>(gkResponse.payload().data());
+-											HardwareAuthToken authToken;
+-											authToken.timestamp.milliSeconds = betoh64(hwAuthToken->timestamp);
+-											authToken.challenge = hwAuthToken->challenge;
+-											authToken.userId = hwAuthToken->user_id;
+-											authToken.authenticatorId = hwAuthToken->authenticator_id;
+-											authToken.authenticatorType = static_cast<HardwareAuthenticatorType>(
+-													betoh32(hwAuthToken->authenticator_type));
+-											authToken.mac.assign(&hwAuthToken->hmac[0], &hwAuthToken->hmac[32]);
+-											AIBinder* authzAIBinder = AServiceManager_getService("android.security.authorization");
+-											::ndk::SpAIBinder binder(authzAIBinder);
+-											auto service = aidl::android::security::authorization::IKeystoreAuthorization::fromBinder(binder);
+-											if (service == NULL) {
+-												printf("error: could not connect to keystore service\n");
+-												ALOGE("error: could not connect to keystore service\n");
+-											}
+-											auto binder_result = service->addAuthToken(authToken);
+-										}
+-									}
+-								 );
+-			free(gk_pwd_token);
+-			if (!hwRet.isOk()) {
+-				printf("gatekeeper verification failed\n");
+-				return Free_Return(retval, weaver_key, &pwd);
++			if (aidl_gk_device) {
++				std::vector<uint8_t> pwd_handle(
++						(const uint8_t*)pwd.password_handle,
++						(const uint8_t*)pwd.password_handle + pwd.handle_len);
++				std::vector<uint8_t> gk_token(
++						(const uint8_t*)gk_pwd_token,
++						(const uint8_t*)gk_pwd_token + SHA512_DIGEST_LENGTH);
++				AidlGatekeeperVerifyResponse response;
++				auto status = aidl_gk_device->verify(fakeUid(user_id), 0 /* challenge */,
++						pwd_handle, gk_token, &response);
++				vold::memset_s(gk_token.data(), 0, gk_token.size());
++				free(gk_pwd_token);
++				if (!status.isOk() || response.statusCode < AidlIGatekeeper::STATUS_OK) {
++					printf("AIDL gatekeeper verification failed\n");
++					return Free_Return(retval, weaver_key, &pwd);
++				}
++
++				::ndk::SpAIBinder authz_binder(
++						AServiceManager_checkService("android.security.authorization"));
++				auto authz = aidl::android::security::authorization::IKeystoreAuthorization::fromBinder(
++						authz_binder);
++				if (!authz || !authz->addAuthToken(response.hardwareAuthToken).isOk()) {
++					printf("failed to submit gatekeeper auth token\n");
++					return Free_Return(retval, weaver_key, &pwd);
++				}
++			} else {
++				android::hardware::hidl_vec<uint8_t> pwd_handle_hidl;
++				pwd_handle_hidl.setToExternal(const_cast<uint8_t *>(
++						(const uint8_t *)pwd.password_handle), pwd.handle_len);
++				android::hardware::hidl_vec<uint8_t> gk_pwd_token_hidl;
++				gk_pwd_token_hidl.setToExternal((uint8_t*)gk_pwd_token, SHA512_DIGEST_LENGTH);
++				GKResponse gkResponse;
++				android::hardware::Return<void> hwRet = gk_device->verify(
++						fakeUid(user_id), 0 /* challenge */, pwd_handle_hidl, gk_pwd_token_hidl,
++						[&gkResponse](const android::hardware::gatekeeper::V1_0::GatekeeperResponse &rsp) {
++							if (rsp.code >= android::hardware::gatekeeper::V1_0::GatekeeperStatusCode::STATUS_OK)
++								gkResponse = GKResponse::ok({rsp.data.begin(), rsp.data.end()});
++						});
++				vold::memset_s(gk_pwd_token, 0, SHA512_DIGEST_LENGTH);
++				free(gk_pwd_token);
++				if (!hwRet.isOk() || gkResponse.payload().empty()) {
++					printf("HIDL gatekeeper verification failed\n");
++					return Free_Return(retval, weaver_key, &pwd);
++				}
++
++				const hw_auth_token_t* hwAuthToken =
++						reinterpret_cast<const hw_auth_token_t*>(gkResponse.payload().data());
++				HardwareAuthToken authToken;
++				authToken.timestamp.milliSeconds = betoh64(hwAuthToken->timestamp);
++				authToken.challenge = hwAuthToken->challenge;
++				authToken.userId = hwAuthToken->user_id;
++				authToken.authenticatorId = hwAuthToken->authenticator_id;
++				authToken.authenticatorType = static_cast<HardwareAuthenticatorType>(
++						betoh32(hwAuthToken->authenticator_type));
++				authToken.mac.assign(&hwAuthToken->hmac[0], &hwAuthToken->hmac[32]);
++				::ndk::SpAIBinder authz_binder(
++						AServiceManager_checkService("android.security.authorization"));
++				auto authz = aidl::android::security::authorization::IKeystoreAuthorization::fromBinder(
++						authz_binder);
++				if (!authz || !authz->addAuthToken(authToken).isOk()) {
++					printf("failed to submit gatekeeper auth token\n");
++					return Free_Return(retval, weaver_key, &pwd);
++				}
+ 			}
+ 		}
+ 	}
+diff --git a/FsCrypt.cpp b/FsCrypt.cpp
+index 7505e560451c24f50bf1d1615e37b1b9a1c3acf9..fa2ecd793834ce61e7801dd8c71fbd1423a4cd3b 100644
+--- a/FsCrypt.cpp
++++ b/FsCrypt.cpp
+@@ -430,7 +430,14 @@ static bool load_all_de_keys() {
+         }
+         LOG(INFO) << "Installed de key for user " << user_id;
+         std::string user_prop = "twrp.user." + std::to_string(user_id) + ".decrypt";
+-        property_set(user_prop.c_str(), "0");
++        char user_decrypt_state[PROPERTY_VALUE_MAX];
++        property_get(user_prop.c_str(), user_decrypt_state, "");
++        // load_all_de_keys() can run again after a successful CE unlock when
++        // recovery refreshes /data.  Do not erase the unlock state that
++        // Mark_User_Decrypted() recorded in the same recovery session.
++        if (user_decrypt_state[0] == '\0') {
++            property_set(user_prop.c_str(), "0");
++        }
+     }
+     // fscrypt:TODO: go through all DE directories, ensure that all user dirs have the
+     // correct policy set on them, and that no rogue ones exist.
+diff --git a/KeyStorage.cpp b/KeyStorage.cpp
+index 51fc4f62967c7ad6f5081cd00c94df3861b97646..80b8d4bbef20cb5dc8a66bf1a5122d1c9a482419 100644
+--- a/KeyStorage.cpp
++++ b/KeyStorage.cpp
+@@ -348,7 +348,7 @@ static KeymasterOperation BeginKeymasterOp(Keymaster& keymaster, const std::stri
+     LOG(INFO) << "reading blob_file: " << blob_file;
+     std::string blob_dir(kFn_keymaster_key_blob);
+     std::string temp_dir = "/tmp/" + blob_dir + "/";
+-    if (TEMP_FAILURE_RETRY(mkdir(temp_dir.c_str(), 0700)) == -1) {
++    if (TEMP_FAILURE_RETRY(mkdir(temp_dir.c_str(), 0700)) == -1 && errno != EEXIST) {
+         PLOG(ERROR) << "key mkdir " << temp_dir;
+     }
+     auto upgraded_blob_file = temp_dir + kFn_keymaster_key_blob;
+diff --git a/KeyUtil.cpp b/KeyUtil.cpp
+index 92735643a355d4ac4cdc7d80ab2283e2bb2badbf..12963891bdd760143fc9f501ccf5a1dbe279557a 100644
+--- a/KeyUtil.cpp
++++ b/KeyUtil.cpp
+@@ -314,7 +314,17 @@ bool installKey(const std::string& mountpoint, const EncryptionOptions& options,
+     std::string ref = keyrefstring(policy->key_raw_ref);
+     LOG(INFO) << "Installed fscrypt key with ref " << ref << " to " << mountpoint;
+ 
+-    if (!installProvisioningKey(key, ref, arg->key_spec)) return false;
++    // Recovery keeps /data mounted for the lifetime of the process, so the
++    // filesystem key installed above is sufficient for decryption.  Some
++    // recovery ramdisks do not create Android's optional "fscrypt" session
++    // keyring; failing the whole operation here makes a successfully installed
++    // key look invalid and causes the FBE path to fall back to legacy FDE.
++    // Keep the provisioning copy when available, but match the working TWRP
++    // behavior and do not reject the filesystem key when that cache is absent.
++    if (!installProvisioningKey(key, ref, arg->key_spec)) {
++        LOG(WARNING) << "Unable to cache fscrypt key " << ref
++                     << " in the recovery session keyring; continuing with filesystem key";
++    }
+     return true;
+ }
+ 
+diff --git a/Keymaster.cpp b/Keymaster.cpp
+index 4781d9114792e98d566a153bd279ea52501b9c1d..3762f305f74acf2fcec7565b4a05a429b2d5ea21 100644
+--- a/Keymaster.cpp
++++ b/Keymaster.cpp
+@@ -16,6 +16,9 @@
+ 
+ #include "Keymaster.h"
+ 
++#include <chrono>
++#include <thread>
++
+ #include <android-base/logging.h>
+ 
+ #include <aidl/android/hardware/security/keymint/SecurityLevel.h>
+@@ -104,7 +107,21 @@ bool KeymasterOperation::finish(std::string* output) {
+ }
+ 
+ Keymaster::Keymaster() {
+-    ::ndk::SpAIBinder binder(AServiceManager_waitForService(keystore2_service_name));
++    // Keystore2 starts in parallel with recovery and can register several
++    // seconds after the process itself is reported running.  Poll for a
++    // bounded interval: a one-shot check races normal startup, while
++    // waitForService can freeze recovery forever when a proprietary service is
++    // broken or absent.
++    ::ndk::SpAIBinder binder;
++    constexpr auto kKeystoreStartupTimeout = std::chrono::seconds(15);
++    constexpr auto kKeystorePollInterval = std::chrono::milliseconds(100);
++    const auto deadline = std::chrono::steady_clock::now() + kKeystoreStartupTimeout;
++    do {
++        binder = ::ndk::SpAIBinder(AServiceManager_checkService(keystore2_service_name));
++        if (binder.get() != nullptr) break;
++        std::this_thread::sleep_for(kKeystorePollInterval);
++    } while (std::chrono::steady_clock::now() < deadline);
++
+     auto keystore2Service = ks2::IKeystoreService::fromBinder(binder);
+ 
+     if (!keystore2Service) {
+diff --git a/Weaver1.cpp b/Weaver1.cpp
+index ea357edccaaa8a784ee17c694e1bee94035906b6..c7277cfdcf8ce99073c1748ad4ee0a782ef9fde4 100644
+--- a/Weaver1.cpp
++++ b/Weaver1.cpp
+@@ -28,7 +28,9 @@
+ //#include <keystore/authorization_set.h>
+ //#include <keystore/keystore_hidl_support.h>
+ 
++#include <android/binder_manager.h>
+ #include <android/hardware/weaver/1.0/IWeaver.h>
++#include <aidl/android/hardware/weaver/IWeaver.h>
+ 
+ #include <iostream>
+ #define ERROR 1
+@@ -48,13 +50,30 @@ namespace android {
+ namespace vold {
+ 
+ Weaver::Weaver() {
+-	mDevice = ::android::hardware::weaver::V1_0::IWeaver::getService();
++	const std::string instance =
++			std::string(::aidl::android::hardware::weaver::IWeaver::descriptor) + "/default";
++	AIBinder* binder = AServiceManager_checkService(instance.c_str());
++	if (binder != nullptr) {
++		mAidlDevice = ::aidl::android::hardware::weaver::IWeaver::fromBinder(
++				ndk::SpAIBinder(binder));
++	}
++	if (mAidlDevice == nullptr) {
++		mDevice = ::android::hardware::weaver::V1_0::IWeaver::getService();
++	}
+ 	GottenConfig = false;
+ }
+ 
+ bool Weaver::GetConfig() {
+ 	if (GottenConfig)
+ 		return true;
++	if (mAidlDevice != nullptr) {
++		auto ret = mAidlDevice->getConfig(&aidlConfig);
++		if (ret.isOk()) {
++			GottenConfig = true;
++			return true;
++		}
++		return false;
++	}
+ 
+ 	WeaverStatus status;
+ 	WeaverConfig cfg;
+@@ -76,6 +95,10 @@ bool Weaver::GetConfig() {
+ bool Weaver::GetSlots(uint32_t* slots) {
+ 	if (!GetConfig())
+ 		return false;
++	if (mAidlDevice != nullptr) {
++		*slots = aidlConfig.slots;
++		return true;
++	}
+ 	*slots = config.slots;
+ 	return true;
+ }
+@@ -83,6 +106,10 @@ bool Weaver::GetSlots(uint32_t* slots) {
+ bool Weaver::GetKeySize(uint32_t* keySize) {
+ 	if (!GetConfig())
+ 		return false;
++	if (mAidlDevice != nullptr) {
++		*keySize = aidlConfig.keySize;
++		return true;
++	}
+ 	*keySize = config.keySize;
+ 	return true;
+ }
+@@ -90,6 +117,10 @@ bool Weaver::GetKeySize(uint32_t* keySize) {
+ bool Weaver::GetValueSize(uint32_t* valueSize) {
+ 	if (!GetConfig())
+ 		return false;
++	if (mAidlDevice != nullptr) {
++		*valueSize = aidlConfig.valueSize;
++		return true;
++	}
+ 	*valueSize = config.valueSize;
+ 	return true;
+ }
+@@ -111,6 +142,16 @@ bool Weaver::WeaverVerify(const uint32_t slot, const void* weaver_key, std::vect
+ 		key[index] = *ptr;
+ 		ptr++;
+ 	}
++	if (mAidlDevice != nullptr) {
++		::aidl::android::hardware::weaver::WeaverReadResponse response;
++		auto ret = mAidlDevice->read(slot, key, &response);
++		if (ret.isOk() && response.timeout == 0 &&
++				response.value.size() == static_cast<size_t>(aidlConfig.valueSize)) {
++			*payload = response.value;
++			return true;
++		}
++		return false;
++	}
+ 	const auto readRet = mDevice->read(slot, key, [&](WeaverReadStatus s, WeaverReadResponse r) {
+ 		callbackCalled = true;
+ 		status = s;
+diff --git a/Weaver1.h b/Weaver1.h
+index 22f401e701132cb0856e2d1f8fd9aa24959a722d..e0f92d064a589e463c52c5a185c560391a1f0c61 100644
+--- a/Weaver1.h
++++ b/Weaver1.h
+@@ -29,6 +29,7 @@
+ #include <utility>
+ 
+ #include <android/hardware/weaver/1.0/IWeaver.h>
++#include <aidl/android/hardware/weaver/IWeaver.h>
+ #include "Utils.h"
+ 
+ namespace android {
+@@ -40,7 +41,7 @@ class Weaver {
+ 	public:
+ 		Weaver();
+ 		// false if we failed to open the weaver device.
+-		explicit operator bool() { return mDevice.get() != nullptr; }
++		explicit operator bool() { return (mDevice.get() != nullptr) || (mAidlDevice != nullptr); }
+ 
+ 		bool GetSlots(uint32_t* slots);
+ 		bool GetKeySize(uint32_t* keySize);
+@@ -50,7 +51,9 @@ class Weaver {
+ 
+ 	private:
+ 		sp<hardware::weaver::V1_0::IWeaver> mDevice;
++		std::shared_ptr<::aidl::android::hardware::weaver::IWeaver> mAidlDevice;
+ 		hardware::weaver::V1_0::WeaverConfig config;
++		::aidl::android::hardware::weaver::WeaverConfig aidlConfig;
+ 		bool GottenConfig;
+ 
+ 		bool GetConfig();

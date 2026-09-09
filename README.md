@@ -14,12 +14,17 @@ git clone https://github.com/travismills82/pbrp_device_oplus_infiniti device/opl
 ```
 
 ```shell
+. device/oplus/infiniti/scripts/apply-recovery-patches.sh
 . build/envsetup.sh
 lunch pb_infiniti-eng
-mka pbrp
+WITH_BUNDLED_MAGISK=true make recoveryimage -j2
 ```
 
 If there is no error, recovery.img will be found in `out/target/product/infiniti/recovery.img`
+
+The patch script carries the required PitchBlack 12.1 framework, interface,
+and vold compatibility changes in this device repository. It is safe to run
+again and will stop if the synced source is incompatible.
 
 ## Features
 
@@ -36,6 +41,9 @@ Works:
 - [X] Touch
 - [X] USB OTG
 - [X] Vibrator
+- [X] Battery and charging status
+- [X] Rear camera flashlight
+- [X] Bundled Magisk installer
 
 ## To use it:
 

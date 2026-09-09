@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Travis Mills <travismills82@gmail.com>
+Date: Tue, 8 Sep 2026 21:10:00 -0500
+Subject: [PATCH] interfaces: add the recovery Gatekeeper AIDL v1 contract
+
+Android 12.1 does not contain the stable Gatekeeper AIDL interface exposed
+by the OnePlus 15 vendor service. Add a recovery-local NDK interface with
+the frozen v1 wire contract so vold can verify the Android 16 credential
+without importing a newer platform interface tree.
+---
+
+diff --git a/gatekeeper/aidl/Android.bp b/gatekeeper/aidl/Android.bp
+new file mode 100644
+index 0000000000000000000000000000000000000000..46de998bbb3b1d7acb0ec13ac977a382ce9a22b7
+--- /dev/null
++++ b/gatekeeper/aidl/Android.bp
+@@ -0,0 +1,27 @@
++package {
++    default_applicable_licenses: ["hardware_interfaces_license"],
++}
++
++// Android 12 predates the platform Gatekeeper AIDL definition used by the
++// OnePlus 15. This recovery-only client mirrors the frozen v1 wire interface;
++// the proprietary service remains the source of all credential verification.
++aidl_interface {
++    name: "android.hardware.gatekeeper.pbrp",
++    srcs: ["android/hardware/gatekeeper/*.aidl"],
++    imports: ["android.hardware.security.keymint-V1"],
++    unstable: true,
++    backend: {
++        java: {
++            enabled: false,
++        },
++        cpp: {
++            enabled: false,
++        },
++        ndk: {
++            apps_enabled: false,
++        },
++        rust: {
++            enabled: false,
++        },
++    },
++}
+diff --git a/gatekeeper/aidl/android/hardware/gatekeeper/GatekeeperEnrollResponse.aidl b/gatekeeper/aidl/android/hardware/gatekeeper/GatekeeperEnrollResponse.aidl
+new file mode 100644
+index 0000000000000000000000000000000000000000..59a6b0dab62d162fba9d8de376df5d73c770a907
+--- /dev/null
++++ b/gatekeeper/aidl/android/hardware/gatekeeper/GatekeeperEnrollResponse.aidl
+@@ -0,0 +1,8 @@
++package android.hardware.gatekeeper;
++
++parcelable GatekeeperEnrollResponse {
++    int statusCode;
++    int timeoutMs;
++    long secureUserId;
++    byte[] data;
++}
+diff --git a/gatekeeper/aidl/android/hardware/gatekeeper/GatekeeperVerifyResponse.aidl b/gatekeeper/aidl/android/hardware/gatekeeper/GatekeeperVerifyResponse.aidl
+new file mode 100644
+index 0000000000000000000000000000000000000000..52cb8bd412bc1f17a8cdeb49a8d2d784dd612424
+--- /dev/null
++++ b/gatekeeper/aidl/android/hardware/gatekeeper/GatekeeperVerifyResponse.aidl
+@@ -0,0 +1,9 @@
++package android.hardware.gatekeeper;
++
++import android.hardware.security.keymint.HardwareAuthToken;
++
++parcelable GatekeeperVerifyResponse {
++    int statusCode;
++    int timeoutMs;
++    HardwareAuthToken hardwareAuthToken;
++}
+diff --git a/gatekeeper/aidl/android/hardware/gatekeeper/IGatekeeper.aidl b/gatekeeper/aidl/android/hardware/gatekeeper/IGatekeeper.aidl
+new file mode 100644
+index 0000000000000000000000000000000000000000..7844608929ff0f235990aa9a128369bc4f47b810
+--- /dev/null
++++ b/gatekeeper/aidl/android/hardware/gatekeeper/IGatekeeper.aidl
+@@ -0,0 +1,19 @@
++package android.hardware.gatekeeper;
++
++import android.hardware.gatekeeper.GatekeeperEnrollResponse;
++import android.hardware.gatekeeper.GatekeeperVerifyResponse;
++
++interface IGatekeeper {
++    const int STATUS_REENROLL = 1;
++    const int STATUS_OK = 0;
++    const int ERROR_GENERAL_FAILURE = -1;
++    const int ERROR_RETRY_TIMEOUT = -2;
++    const int ERROR_NOT_IMPLEMENTED = -3;
++
++    void deleteAllUsers();
++    void deleteUser(in int uid);
++    GatekeeperEnrollResponse enroll(in int uid, in byte[] currentPasswordHandle,
++            in byte[] currentPassword, in byte[] desiredPassword);
++    GatekeeperVerifyResponse verify(in int uid, in long challenge,
++            in byte[] enrolledPasswordHandle, in byte[] providedPassword);
++}

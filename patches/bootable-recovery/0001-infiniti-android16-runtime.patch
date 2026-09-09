@@ -1,0 +1,297 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Travis Mills <travismills82@gmail.com>
+Date: Tue, 8 Sep 2026 21:09:00 -0500
+Subject: [PATCH] recovery: support the Infiniti Android 16 runtime
+
+PitchBlack's Android 12.1 recovery predates the HAL and boot-control
+interfaces shipped by the OnePlus 15. Add the recovery-side AIDL dependency
+hooks, defer credential work until the device services are ready, preserve
+the decrypted-user state across data refreshes, and route slot changes
+through the packaged AIDL boot-control client.
+
+Also support the phone's two rear flash LED nodes, correct the configured
+maximum brightness handling, and make the Magisk action use the bundled
+ramdisk payload.
+---
+
+diff --git a/Android.mk b/Android.mk
+index 2091f908b0985d395b4828948bf7eb93db4724f0..5b4ac49431cca2ab009e6dbb1ea91722e6bc3ca3 100644
+--- a/Android.mk
++++ b/Android.mk
+@@ -76,7 +76,7 @@ ifeq ($(PB_DISABLE_DEFAULT_TREBLE_COMP),true)
+     LOCAL_CFLAGS += -DPB_DISABLE_DEFAULT_TREBLE_COMP=$(PB_DISABLE_DEFAULT_TREBLE_COMP)
+ endif
+ ifneq ($(PB_TORCH_MAX_BRIGHTNESS),)
+-	LOCAL_CFLAGS += -DPB_MAX_BRIGHT_VALUE=\"$(PB_TORCH_BRIGHTNESS_MAX)\"
++	LOCAL_CFLAGS += -DPB_MAX_BRIGHT_VALUE=$(PB_TORCH_MAX_BRIGHTNESS)
+ endif
+ 
+ LOCAL_SRC_FILES := \
+@@ -182,6 +182,9 @@ ifeq ($(AB_OTA_UPDATER),true)
+     TWRP_REQUIRED_MODULES += libhardware android.hardware.boot@1.0-service android.hardware.boot@1.0-service.rc \
+     android.hardware.boot@1.1-service android.hardware.boot@1.1-service.rc android.hardware.boot@1.1.xml \
+     android.hardware.boot@1.2-service android.hardware.boot@1.2-service.rc android.hardware.boot@1.2.xml
++ifeq ($(TW_USE_AIDL_BOOT_CONTROL),true)
++    LOCAL_CFLAGS += -DTW_USE_AIDL_BOOT_CONTROL
++endif
+ endif
+ 
+ ifeq ($(PRODUCT_USE_DYNAMIC_PARTITIONS),true)
+@@ -350,7 +353,9 @@ ifeq ($(TW_INCLUDE_CRYPTO), true)
+ 	android.security.authorization-ndk_platform \
+         android.hardware.oemlock@1.0 libf2fs_sparseblock libbinder libbinder_ndk \
+         libandroidicu.recovery \
++        android.hardware.gatekeeper.pbrp-ndk_platform \
+         android.hardware.gatekeeper@1.0 \
++        android.hardware.weaver-V1-ndk_platform \
+         android.hardware.weaver@1.0 \
+         android.frameworks.stats@1.0 \
+         android.security.maintenance-ndk_platform \
+diff --git a/gui/action.cpp b/gui/action.cpp
+index daf579d24e37c0aecd4d50676a9c339cc3b74f2c..5fa1572c27b0a7e485ac8edfeeb5a8a328a7425e 100755
+--- a/gui/action.cpp
++++ b/gui/action.cpp
+@@ -2408,9 +2408,10 @@ int GUIAction::repack(std::string arg __unused)
+ int GUIAction::flashlight(std::string arg __unused)
+ {
+ 	int br_value = DataManager::GetIntValue("pb_bright_value");
+-	string str_val, file, flashp1 = "/sys/class/leds", flashp2 = "/flashlight", flashpath;
++	string file, flashp1 = "/sys/class/leds", flashp2 = "/flashlight", flashpath;
+ 	string bright = "/brightness";
+ 	string switch_path = TWFunc::Path_Exists(flashp1 + "/led:switch" + bright) ? (flashp1 + "/led:switch") : (flashp1 + "/led:switch_0");
++	std::vector<string> flashpaths;
+ 	DIR* d;
+ 	struct dirent* de __attribute__((unused));
+ #ifdef PB_MAX_BRIGHT_VALUE
+@@ -2425,12 +2426,32 @@ int GUIAction::flashlight(std::string arg __unused)
+ 		d = opendir(flashpath.c_str());
+ 		if (d != NULL) {
+ 			flashpath += bright;
++			closedir(d);
++			flashpaths.push_back(flashpath);
+ 			DataManager::SetValue("pb_flashlight_theme_support", "1");
+ 		}
+ 	}
++#ifdef PB_TORCH_PATH_2
++	flashpath = PB_TORCH_PATH_2;
++	LOGINFO("flashlight: Secondary custom node located at '%s'\n", flashpath.c_str());
++	if (TWFunc::Path_Exists(flashpath))
++	{
++		d = opendir(flashpath.c_str());
++		if (d != NULL) {
++			flashpath += bright;
++			closedir(d);
++			flashpaths.push_back(flashpath);
++		}
++	}
++#endif
+ #else
+ 	flashpath = flashp1 + flashp2 + bright;
+-	if (!TWFunc::Path_Exists(flashpath))
++	if (TWFunc::Path_Exists(flashpath))
++	{
++		flashpaths.push_back(flashpath);
++		DataManager::SetValue("pb_flashlight_theme_support", "1");
++	}
++	else
+ 	{
+ 		d = opendir(flashp1.c_str());
+ 		if (d == NULL)
+@@ -2441,9 +2462,10 @@ int GUIAction::flashlight(std::string arg __unused)
+ 		while ((de = readdir(d)) != NULL)
+ 		{
+ 			file = de->d_name;
+-			if(file.find("torch") != string::npos || file.find("torch_"))
++			if(file.find("torch") != string::npos || file.find("torch_") != string::npos)
+ 			{
+ 				flashpath = flashp1 + "/" + file + bright;
++				flashpaths.push_back(flashpath);
+ 				break;
+ 			}
+ 		}
+@@ -2452,25 +2474,35 @@ int GUIAction::flashlight(std::string arg __unused)
+ 		DataManager::SetValue("pb_flashlight_theme_support", "1");
+ 	}
+ #endif
+-	str_val="";
+-	if (TWFunc::Path_Exists(flashpath)) {
+-		LOGINFO("Flashlight Node Located at '%s'\n", flashpath.c_str());
++	if (!flashpaths.empty()) {
++		for (const auto& path : flashpaths)
++			LOGINFO("Flashlight Node Located at '%s'\n", path.c_str());
+ 		if (DataManager::GetIntValue("pb_torch_on") == 1)
+ 		{
+ 			LOGINFO("Flashlight Turning Off\n");
+ 			if (TWFunc::Path_Exists(switch_path))
+ 				TWFunc::write_to_file(switch_path + bright, "0");
+-			TWFunc::write_to_file(flashpath, "0");
++			for (const auto& path : flashpaths)
++				TWFunc::write_to_file(path, "0");
+ 			DataManager::SetValue("pb_torch_on", "0");
+ 		}
+ 		else
+ 		{
++			bool success = true;
+ 			LOGINFO("Flashlight Turning On\n");
+ 			LOGINFO("Flashlight: Brightning value '%d'\n", br_value);
+-			TWFunc::write_to_file(flashpath, std::to_string(br_value));
++			for (const auto& path : flashpaths)
++				success = TWFunc::write_to_file(path, std::to_string(br_value)) && success;
+ 			if (TWFunc::Path_Exists(switch_path))
+-				TWFunc::write_to_file(switch_path + bright, "1");
+-			DataManager::SetValue("pb_torch_on", "1");
++				success = TWFunc::write_to_file(switch_path + bright, "1") && success;
++			if (success) {
++				DataManager::SetValue("pb_torch_on", "1");
++			} else {
++				LOGINFO("Flashlight: Failed to enable every configured node\n");
++				for (const auto& path : flashpaths)
++					TWFunc::write_to_file(path, "0");
++				DataManager::SetValue("pb_torch_on", "0");
++			}
+ 		}
+ 	} else {
+ 		LOGINFO("Incorrect Flashlight Path\n");
+diff --git a/gui/libguitwrp_defaults.go b/gui/libguitwrp_defaults.go
+index 1e09bd3e6d7fee2d14c53714a182c67a9a3d2c2e..2b09368e4ff316c1a40d3ed5f6d46c04cb31ed88 100644
+--- a/gui/libguitwrp_defaults.go
++++ b/gui/libguitwrp_defaults.go
+@@ -201,6 +201,10 @@ func globalFlags(ctx android.BaseContext) []string {
+ 		cflags = append(cflags, "-DPB_TORCH_PATH="+getMakeVars(ctx, "PB_TORCH_PATH"))
+ 	}
+ 
++	if getMakeVars(ctx, "PB_TORCH_PATH_2") != "" {
++		cflags = append(cflags, "-DPB_TORCH_PATH_2="+getMakeVars(ctx, "PB_TORCH_PATH_2"))
++	}
++
+ 	if getMakeVars(ctx, "PB_TORCH_MAX_BRIGHTNESS") != "" {
+ 		cflags = append(cflags, "-DPB_MAX_BRIGHT_VALUE="+getMakeVars(ctx, "PB_TORCH_MAX_BRIGHTNESS"))
+ 	}
+diff --git a/gui/theme/portrait_hdpi/extras.xml b/gui/theme/portrait_hdpi/extras.xml
+index a2f4de8678da246342d96520246d6422e3122d34..fe579e90421cd0d65cb080061125f93a37e3be20 100644
+--- a/gui/theme/portrait_hdpi/extras.xml
++++ b/gui/theme/portrait_hdpi/extras.xml
+@@ -76,7 +76,7 @@
+ 				<text>{@Magisk_btn=Magisk}</text>
+ 				<actions>
+ 					<action function="set">tw_back=tools</action>
+-					<action function="set">tw_filename=/sdcard/PBRP/tools/magisk.zip</action>
++					<action function="set">tw_filename=/system/etc/magisk/Magisk.zip</action>
+ 					<action function="set">tw_action=queuezip</action>
+ 					<action function="set">_install_built_in_zip=1</action>
+ 					<action function="set">tw_has_action2=1</action>
+diff --git a/libtar/Android.mk b/libtar/Android.mk
+index c3bb691f3508a3e9a487334b9d86f5ea5458c3f3..c445f3dc93ec513393523327dc993c3d0f8ec562 100755
+--- a/libtar/Android.mk
++++ b/libtar/Android.mk
+@@ -22,8 +22,10 @@ ifeq ($(TW_INCLUDE_CRYPTO_FBE), true)
+         android.hardware.keymaster@3.0 \
+         android.hardware.keymaster@4.0 \
+         android.hardware.keymaster@4.1 \
++        android.hardware.weaver-V1-ndk_platform \
+         android.hardware.weaver@1.0 \
+         android.security.apc-ndk_platform \
++        android.hardware.gatekeeper.pbrp-ndk_platform \
+         android.system.keystore2-V1-ndk_platform \
+         android.security.authorization-ndk_platform \
+         android.security.maintenance-ndk_platform \
+diff --git a/partitionmanager.cpp b/partitionmanager.cpp
+index a311808b69dbade392e6100fddf50d8f8e66d7db..f9b5def50144095ac8a8bb8d2c7f22f82a9c3059 100755
+--- a/partitionmanager.cpp
++++ b/partitionmanager.cpp
+@@ -268,6 +268,7 @@ void inline Process_Keymaster_Version(TWPartition *ven, bool Display_Error) {
+ }
+ 
+ int TWPartitionManager::Process_Fstab(string Fstab_Filename, bool Display_Error, bool recovery_mode) {
++	property_set("twrp.fstab.ready", "0");
+ 	FILE* fstabFile;
+ 	char fstab_line[MAX_FSTAB_LINE_LENGTH];
+ 	bool parse_userdata = false;
+@@ -439,6 +440,10 @@ clear:
+ 	if (recovery_mode)
+ 		Process_Keymaster_Version(ven, false);
+ 	if (ven) ven->UnMount(Display_Error);
++	// Device HALs consume the recovery ramdisk at /vendor and /odm. Publish
++	// readiness only after temporary stock mounts no longer hide those files.
++	if ((!ven || !ven->Is_Mounted()) && (!odm || !odm->Is_Mounted()))
++		property_set("twrp.fstab.ready", "1");
+ 	return true;
+ }
+ 
+@@ -2122,6 +2127,10 @@ void TWPartitionManager::Post_Decrypt(const string& Block_Device) {
+ 
+ void TWPartitionManager::Parse_Users() {
+ #ifdef TW_INCLUDE_FBE
++	// This is also called after /data is remounted following decryption.  Rebuild
++	// the list instead of retaining stale or duplicate entries from the previous
++	// pass.
++	Users_List.clear();
+ 	char user_check_result[PROPERTY_VALUE_MAX];
+ 	for (int userId = 0; userId <= 9999; userId++) {
+ 		string prop = "twrp.user." + to_string(userId) + ".decrypt";
+@@ -2242,11 +2251,37 @@ int TWPartitionManager::Decrypt_Device(string Password, int user_id) {
+ 				user_need_decrypt = true;
+ 			}
+ 		}
++		// The in-memory user list can become stale after metadata encryption has
++		// mounted /data or the recovery UI has been restarted.  The property is
++		// only set to 1 after fscrypt has actually installed the user's CE key, so
++		// use it as the authoritative cross-check before skipping verification.
++		char user_decrypt_state[PROPERTY_VALUE_MAX];
++		const string user_decrypt_prop =
++				"twrp.user." + to_string(user_id) + ".decrypt";
++		property_get(user_decrypt_prop.c_str(), user_decrypt_state, "0");
++		if (strcmp(user_decrypt_state, "1") != 0) {
++			user_need_decrypt = true;
++		}
+ 		if (!user_need_decrypt) {
+ 			LOGINFO("User %d does not require decryption\n", user_id);
+ 			return 0;
+ 		}
+ 
++		// The Infiniti device helper publishes this state before restarting the
++		// secure-element, Weaver, KeyMint, and Keystore services.  Never submit a
++		// credential while that chain is still being assembled.
++		std::string decrypt_prereq =
++				android::base::GetProperty("twrp.decrypt.prereq", "");
++		for (int wait = 0; decrypt_prereq == "preparing" && wait < 60; ++wait) {
++			sleep(1);
++			decrypt_prereq =
++					android::base::GetProperty("twrp.decrypt.prereq", "");
++		}
++		if (!decrypt_prereq.empty() && decrypt_prereq != "ready") {
++			gui_err("decrypt_services_unavailable=Decryption services are not ready. Please retry after recovery finishes starting.");
++			return -1;
++		}
++
+ 		int retry_count = 10;
+ 		while (!TWFunc::Path_Exists("/data/system/users/gatekeeper.password.key") && --retry_count)
+ 			usleep(2000);	// A small sleep is needed after mounting /data to ensure reliable decrypt...
+@@ -3447,6 +3482,16 @@ void TWPartitionManager::Set_Active_Slot(const string& Slot) {
+ 	LOGINFO("Setting active slot %s\n", Slot.c_str());
+ #ifdef AB_OTA_UPDATER
+ 	if (!Active_Slot_Display.empty()) {
++#ifdef TW_USE_AIDL_BOOT_CONTROL
++		const string slot_number = Slot == "B" ? "1" : "0";
++		const string command = "/system/bin/pbrp-bootctl set-active-boot-slot " + slot_number;
++		if (TWFunc::Exec_Cmd(command, false, true) != 0) {
++			gui_msg(Msg(msg::kError,
++									"unable_set_boot_slot=Error changing bootloader boot slot to {1}")(Slot));
++			return;
++		}
++		DataManager::SetValue("tw_active_slot", Slot);
++#else
+ 		android::sp<IBootControl> module = IBootControl::getService();
+ 		if (module == nullptr) {
+ 			LOGERR("Error getting bootctrl module.\n");
+@@ -3462,8 +3507,9 @@ void TWPartitionManager::Set_Active_Slot(const string& Slot) {
+ 										"unable_set_boot_slot=Error changing bootloader boot slot to {1}")(Slot));
+ 		}
+ 		DataManager::SetValue("tw_active_slot",
+-													Slot);	// Doing this outside of this if block may result in a seg fault
++											Slot);	// Doing this outside of this if block may result in a seg fault
+ 																	// because the DataManager may not be ready yet
++#endif
+ 	}
+ #else
+ 	LOGERR("Boot slot feature not present\n");

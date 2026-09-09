@@ -1,0 +1,21 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Travis Mills <travismills82@gmail.com>
+Date: Tue, 8 Sep 2026 21:12:00 -0500
+Subject: [PATCH] pb: export the secondary torch path to Soong
+
+Expose PB_TORCH_PATH_2 to the recovery GUI defaults so devices with separate
+warm and cool camera-flash channels can switch both nodes together.
+---
+
+diff --git a/config/BoardConfigSoong.mk b/config/BoardConfigSoong.mk
+index 83efa359644dab39cb91444f0c88efa6f53b0644..ee6712c717aa7e60e6b5f01fff50ad79d5d38508 100644
+--- a/config/BoardConfigSoong.mk
++++ b/config/BoardConfigSoong.mk
+@@ -30,6 +30,7 @@ EXPORT_TO_SOONG := \
+     TW_CUSTOM_CLOCK_POS \
+     TW_CUSTOM_CPU_POS \
+     PB_TORCH_PATH \
++    PB_TORCH_PATH_2 \
+     PB_TORCH_MAX_BRIGHTNESS
+ 
+ # Setup SOONG_CONFIG_* vars to export the vars listed above.
